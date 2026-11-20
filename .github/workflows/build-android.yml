@@ -9,15 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Write google-services.json from secret
-        env:
-          GSJ: ${{ secrets.GOOGLE_SERVICES_JSON }}
-        run: |
-          if [ -z "$GSJ" ]; then
-            echo "Missing repository secret GOOGLE_SERVICES_JSON (Settings > Secrets and variables > Actions)."
-            exit 1
-          fi
-          printf '%s' "$GSJ" > android-project/app/google-services.json
+      - name: Check google-services.json
+        run: test -f android-project/app/google-services.json
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
