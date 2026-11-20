@@ -1,0 +1,6 @@
+{
+  "name": "LiteWire",
+  "description": "Ultra-low-data end-to-end encrypted online messaging application and native Android Kotlin/Jetpack Compose architecture.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

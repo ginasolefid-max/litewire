@@ -1,0 +1,3 @@
+-keepattributes Signature,InnerClasses,EnclosingMethod
+-keep class com.litewire.app.data.remote.** { *; }
+-dontwarn javax.annotation.**
