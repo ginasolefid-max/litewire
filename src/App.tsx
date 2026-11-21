@@ -749,6 +749,7 @@ export default function App() {
           lastTimestamp: c.lastMessage?.ts || c.updatedAt,
         });
       }
+      conversationsRef.current = mapped;
       setConversations(mapped);
     },
     [recordInbound]

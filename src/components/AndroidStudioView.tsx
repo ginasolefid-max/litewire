@@ -13,6 +13,7 @@ import {
   Wifi,
 } from 'lucide-react';
 import { AndroidProjectFile } from '../types/messaging';
+import PWAInstallButton from './PWAInstallButton';
 
 const PHASES = [
   {
@@ -336,18 +337,19 @@ export default function AndroidStudioView() {
             </div>
             <ol className="space-y-3 text-xs leading-relaxed text-slate-600 dark:text-slate-400 list-decimal pl-4">
               <li>
-                Download <strong className="text-slate-900 dark:text-slate-200">LiteWire-Android-Kotlin.zip</strong> and extract it.
+                <strong className="text-slate-900 dark:text-slate-200">Phone says &ldquo;Blocked by your IT admin&rdquo;?</strong> Managed/work/school phones block <code className="font-mono">.apk</code> sideloading. Install the full-featured <strong className="text-slate-900 dark:text-slate-200">LiteWire PWA</strong> directly from Chrome/Safari instead (includes audio/video calls, 100 MB encrypted files/videos, and sound alerts).
               </li>
               <li>
-                Create a Firebase project, enable <strong className="text-slate-900 dark:text-slate-200">Email/Password Auth</strong> and <strong className="text-slate-900 dark:text-slate-200">Cloud Firestore</strong>, and deploy <code className="font-mono">firebase/firestore.rules</code>.
+                To build the APK on GitHub Actions without push blocks, add your Firebase <code className="font-mono">google-services.json</code> content as a GitHub Repository Secret named <code className="font-mono">GOOGLE_SERVICES_JSON</code> (never commit real API keys into git).
               </li>
               <li>
-                Download <code className="font-mono">google-services.json</code> for package <code className="font-mono">com.litewire.app</code> and place it inside <code className="font-mono">app/</code>.
-              </li>
-              <li>
-                Open the folder in <strong className="text-slate-900 dark:text-slate-200">Android Studio Ladybug+</strong> (JDK 17) and run <code className="font-mono">./gradlew assembleDebug</code> for USB testing on two phones, or <code className="font-mono">./gradlew assembleRelease</code> with your signing keystore for a minified R8 APK.
+                Or download <strong className="text-slate-900 dark:text-slate-200">LiteWire-Android-Kotlin.zip</strong>, place <code className="font-mono">google-services.json</code> in <code className="font-mono">app/</code>, and build in Android Studio Ladybug+ (JDK 17).
               </li>
             </ol>
+
+            <div className="pt-1">
+              <PWAInstallButton variant="primary" />
+            </div>
 
             <div className="pt-3 border-t border-slate-200 dark:border-slate-800 space-y-2 text-xs text-slate-600 dark:text-slate-400">
               <div className="flex items-center gap-2 text-slate-900 dark:text-slate-100 font-medium">
@@ -355,11 +357,11 @@ export default function AndroidStudioView() {
                 <span>How to test two real users right now in this Web App:</span>
               </div>
               <p>
-                Open this live app URL in two browser tabs (each tab keeps an independent session via <code className="font-mono">sessionStorage</code>), register <code className="font-mono">@user1</code> in Tab 1 and <code className="font-mono">@user2</code> in Tab 2, search by username, and exchange real-time E2EE messages!
+                Open this live app URL in two browser tabs (each tab keeps an independent session via <code className="font-mono">sessionStorage</code>), register <code className="font-mono">@user1</code> in Tab 1 and <code className="font-mono">@user2</code> in Tab 2, search by username, and exchange real-time E2EE messages, calls, and videos!
               </p>
               <div className="flex items-center gap-2 pt-1 text-slate-500">
                 <Wifi className="w-3.5 h-3.5" />
-                <span>Toggle "Simulate Offline" in Settings to verify pending queue & automatic reconnect flush.</span>
+                <span>Toggle &ldquo;Simulate Offline&rdquo; in Settings to verify pending queue &amp; automatic reconnect flush.</span>
               </div>
             </div>
           </div>

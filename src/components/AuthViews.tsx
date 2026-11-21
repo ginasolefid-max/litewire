@@ -1,6 +1,7 @@
 import { FormEvent, useState } from 'react';
 import { Lock, Shield, ArrowRight, AlertCircle } from 'lucide-react';
 import { ScreenRoute } from '../types/messaging';
+import PWAInstallButton from './PWAInstallButton';
 
 interface AuthViewsProps {
   route: 'splash' | 'login' | 'register';
@@ -52,6 +53,9 @@ export default function AuthViews({
             >
               Create Account
             </button>
+          </div>
+          <div className="flex justify-center">
+            <PWAInstallButton variant="secondary" />
           </div>
           <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed pt-2">
             No SMS credits or promo bundle required. Standard carrier pay-per-use data charges may apply on cellular networks without an active data plan.

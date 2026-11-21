@@ -41,6 +41,7 @@ import {
 import { computeSafetyFingerprint } from '../crypto/e2ee';
 import { formatBytes } from '../services/bandwidth';
 import AttachmentBubble from './AttachmentBubble';
+import PWAInstallButton from './PWAInstallButton';
 
 const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024; // 100 MB maximum
 
@@ -621,6 +622,18 @@ export default function ChatWorkspace({
                   >
                     Test Notification & Arrival Sound
                   </button>
+                </div>
+
+                <div className="flex items-center justify-between gap-3 pt-4 border-t border-slate-100 dark:border-slate-800">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                      Install on Phone
+                    </div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">
+                      Works even if IT admin blocks APKs
+                    </div>
+                  </div>
+                  <PWAInstallButton variant="secondary" />
                 </div>
 
                 {/* Data Consumption Monitor */}

@@ -2,7 +2,19 @@ node_modules/
 build/
 dist/
 coverage/
+data/
 .DS_Store
 *.log
 .env*
 !.env.example
+
+# Android / Gradle local artifacts & secrets
+android-project/.gradle/
+android-project/build/
+android-project/app/build/
+android-project/local.properties
+android-project/app/google-services.json
+*.apk
+*.aab
+*.jks
+*.keystore

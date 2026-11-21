@@ -668,6 +668,7 @@ function walkAndroidDir(dir: string, base: string): Array<{ path: string; conten
   if (!fs.existsSync(dir)) return [];
   const out: Array<{ path: string; content: string; sizeBytes: number }> = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'build' || entry.name === '.gradle' || entry.name === '.idea') continue;
     const full = path.join(dir, entry.name);
     const rel = path.relative(base, full).replace(/\\/g, '/');
     if (entry.isDirectory()) {
