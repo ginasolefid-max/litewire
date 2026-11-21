@@ -31,6 +31,8 @@ jobs:
 
       - name: Set up Android SDK & accept licenses
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
