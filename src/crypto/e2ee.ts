@@ -1,9 +1,12 @@
 // End-to-End Encryption using standard Web Crypto API:
 // - ECDH on NIST P-256 (secp256r1)
 // - HKDF-SHA256 bound to conversationId
-// - AES-256-GCM with fresh 96-bit CSPRNG IV per message
+// - AES-256-GCM with fresh 96-bit CSPRNG IV per message / attachment
+
+import { AttachmentPayload } from '../types/messaging';
 
 const KEY_STORAGE_PREFIX = 'litewire_ecdh_v1_';
+const ATTACHMENT_PREFIX = '__LW_ATT_V1__:';
 
 interface StoredKeyPair {
   publicKeyBase64: string;
@@ -13,8 +16,10 @@ interface StoredKeyPair {
 function arrayBufferToBase64(buf: ArrayBuffer | Uint8Array): string {
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
   let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const slice = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...slice);
   }
   return btoa(binary);
 }
@@ -175,6 +180,84 @@ export async function decryptMessage(
   );
 
   return new TextDecoder().decode(plainBuf);
+}
+
+export function encodeAttachmentEnvelope(attachment: AttachmentPayload): string {
+  return `${ATTACHMENT_PREFIX}${JSON.stringify(attachment)}`;
+}
+
+export function decodeMessageEnvelope(rawPlaintext: string): {
+  plaintext: string;
+  attachment?: AttachmentPayload;
+} {
+  if (!rawPlaintext.startsWith(ATTACHMENT_PREFIX)) {
+    return { plaintext: rawPlaintext };
+  }
+  try {
+    const parsed = JSON.parse(rawPlaintext.slice(ATTACHMENT_PREFIX.length)) as AttachmentPayload;
+    if (parsed && parsed.fileId && parsed.fileName && parsed.fileKeyB64 && parsed.fileIvB64) {
+      const label =
+        parsed.kind === 'video'
+          ? `Video: ${parsed.fileName}`
+          : parsed.kind === 'image'
+          ? `Photo: ${parsed.fileName}`
+          : parsed.kind === 'audio'
+          ? `Audio: ${parsed.fileName}`
+          : `File: ${parsed.fileName}`;
+      return {
+        plaintext: parsed.caption?.trim() ? parsed.caption.trim() : label,
+        attachment: parsed,
+      };
+    }
+  } catch {
+    // Fall back to raw plaintext if malformed
+  }
+  return { plaintext: rawPlaintext };
+}
+
+export async function encryptFileBuffer(plainBuffer: ArrayBuffer): Promise<{
+  encryptedBuffer: ArrayBuffer;
+  fileKeyB64: string;
+  fileIvB64: string;
+}> {
+  const fileKey = await window.crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['encrypt', 'decrypt']
+  );
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const encryptedBuffer = await window.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, tagLength: 128 },
+    fileKey,
+    plainBuffer
+  );
+  const rawKey = await window.crypto.subtle.exportKey('raw', fileKey);
+  return {
+    encryptedBuffer,
+    fileKeyB64: arrayBufferToBase64(rawKey),
+    fileIvB64: arrayBufferToBase64(iv),
+  };
+}
+
+export async function decryptFileBuffer(
+  encryptedBuffer: ArrayBuffer,
+  fileKeyB64: string,
+  fileIvB64: string
+): Promise<ArrayBuffer> {
+  const rawKey = base64ToUint8Array(fileKeyB64);
+  const iv = base64ToUint8Array(fileIvB64);
+  const fileKey = await window.crypto.subtle.importKey(
+    'raw',
+    toArrayBuffer(rawKey),
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['decrypt']
+  );
+  return window.crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: toArrayBuffer(iv), tagLength: 128 },
+    fileKey,
+    encryptedBuffer
+  );
 }
 
 export async function computeSafetyFingerprint(pubKeyA: string, pubKeyB: string): Promise<string> {

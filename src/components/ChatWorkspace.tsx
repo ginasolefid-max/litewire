@@ -1,14 +1,20 @@
-import { FormEvent, useEffect, useRef, useState } from 'react';
+import { ChangeEvent, DragEvent, FormEvent, useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Bell,
   Check,
   CheckCheck,
   Clock,
+  FileText,
+  Film,
+  Image as ImageIcon,
   Lock,
   LogOut,
   MessageSquarePlus,
   Moon,
+  Music,
+  Paperclip,
+  Phone,
   RefreshCw,
   Search,
   Send,
@@ -17,11 +23,15 @@ import {
   Sun,
   Trash2,
   User,
+  Video,
+  Volume2,
+  VolumeX,
   Wifi,
   WifiOff,
   X,
 } from 'lucide-react';
 import {
+  CallType,
   ConversationSummary,
   DataTelemetry,
   DecryptedMessage,
@@ -30,6 +40,9 @@ import {
 } from '../types/messaging';
 import { computeSafetyFingerprint } from '../crypto/e2ee';
 import { formatBytes } from '../services/bandwidth';
+import AttachmentBubble from './AttachmentBubble';
+
+const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024; // 100 MB maximum
 
 interface ChatWorkspaceProps {
   currentUser: UserProfile;
@@ -42,9 +55,17 @@ interface ChatWorkspaceProps {
   hasMoreMessages: boolean;
   onLoadOlderMessages: () => void;
   onSendMessage: (convoId: string, text: string) => Promise<void>;
+  onSendAttachment: (
+    convoId: string,
+    file: File,
+    caption: string,
+    onProgress: (pct: number) => void
+  ) => Promise<void>;
   onDeleteMessageLocally: (convoId: string, messageId: string) => void;
   onClearHistoryLocally: (convoId: string) => void;
   onStartChatWithUser: (peer: UserProfile) => Promise<void>;
+  onStartCall: (convoId: string, peer: UserProfile, callType: CallType) => void;
+  callActive: boolean;
   searchResults: UserProfile[];
   searchingUsers: boolean;
   onSearchUsers: (query: string) => void;
@@ -55,10 +76,14 @@ interface ChatWorkspaceProps {
   onToggleSimulatedOffline: () => void;
   telemetry: DataTelemetry;
   onResetTelemetry: () => void;
+  onAttachmentBytesReceived: (bytes: number) => void;
   darkMode: boolean;
   onToggleDarkMode: () => void;
   notificationsEnabled: boolean;
   onToggleNotifications: () => void;
+  soundEnabled: boolean;
+  onToggleSound: () => void;
+  onTestNotification: () => void;
   onLogout: () => Promise<void>;
   authToken: string;
 }
@@ -74,9 +99,12 @@ export default function ChatWorkspace({
   hasMoreMessages,
   onLoadOlderMessages,
   onSendMessage,
+  onSendAttachment,
   onDeleteMessageLocally,
   onClearHistoryLocally,
   onStartChatWithUser,
+  onStartCall,
+  callActive,
   searchResults,
   searchingUsers,
   onSearchUsers,
@@ -87,17 +115,29 @@ export default function ChatWorkspace({
   onToggleSimulatedOffline,
   telemetry,
   onResetTelemetry,
+  onAttachmentBytesReceived,
   darkMode,
   onToggleDarkMode,
   notificationsEnabled,
   onToggleNotifications,
+  soundEnabled,
+  onToggleSound,
+  onTestNotification,
   onLogout,
+  authToken,
 }: ChatWorkspaceProps) {
   const [draft, setDraft] = useState('');
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
+
   const [searchQuery, setSearchQuery] = useState('');
   const [fingerprint, setFingerprint] = useState<string | null>(null);
   const [showFingerprintModal, setShowFingerprintModal] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const activeConvo = conversations.find((c) => c.id === activeConvoId) || null;
   const visibleMessages = messages.filter((m) => !m.deletedLocally);
@@ -112,6 +152,13 @@ export default function ChatWorkspace({
     }
   }, [route]);
 
+  // Reset staged attachment when switching conversations
+  useEffect(() => {
+    setSelectedFile(null);
+    setAttachmentError(null);
+    setUploadProgress(0);
+  }, [activeConvoId]);
+
   async function handleOpenFingerprint() {
     if (!activeConvo) return;
     const fp = await computeSafetyFingerprint(currentUser.publicKey, activeConvo.peer.publicKey);
@@ -119,9 +166,76 @@ export default function ChatWorkspace({
     setShowFingerprintModal(true);
   }
 
+  function validateAndStageFile(file: File | undefined | null) {
+    if (!file) return;
+    setAttachmentError(null);
+    if (file.size === 0) {
+      setAttachmentError('Cannot send an empty file.');
+      return;
+    }
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      setAttachmentError(
+        `File exceeds the 100 MB maximum limit (selected: ${formatBytes(file.size)}).`
+      );
+      return;
+    }
+    setSelectedFile(file);
+  }
+
+  function handleFileInputChange(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    validateAndStageFile(file);
+    e.target.value = '';
+  }
+
+  function handleDragOver(e: DragEvent<HTMLElement>) {
+    e.preventDefault();
+    if (activeConvo && !uploading) {
+      setIsDraggingOver(true);
+    }
+  }
+
+  function handleDragLeave(e: DragEvent<HTMLElement>) {
+    e.preventDefault();
+    setIsDraggingOver(false);
+  }
+
+  function handleDrop(e: DragEvent<HTMLElement>) {
+    e.preventDefault();
+    setIsDraggingOver(false);
+    if (!activeConvo || uploading) return;
+    const file = e.dataTransfer.files?.[0];
+    validateAndStageFile(file);
+  }
+
   async function handleSendSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!activeConvoId || !draft.trim()) return;
+    if (!activeConvoId || uploading) return;
+
+    if (selectedFile) {
+      if (connectionStatus !== 'connected') {
+        setAttachmentError('Connect to the network before sending files or videos.');
+        return;
+      }
+      const fileToSend = selectedFile;
+      const caption = draft.trim();
+      setUploading(true);
+      setUploadProgress(0);
+      setAttachmentError(null);
+      try {
+        await onSendAttachment(activeConvoId, fileToSend, caption, setUploadProgress);
+        setSelectedFile(null);
+        setDraft('');
+      } catch (err) {
+        setAttachmentError(err instanceof Error ? err.message : 'Failed to upload attachment.');
+      } finally {
+        setUploading(false);
+        setUploadProgress(0);
+      }
+      return;
+    }
+
+    if (!draft.trim()) return;
     const text = draft;
     setDraft('');
     await onSendMessage(activeConvoId, text);
@@ -136,6 +250,17 @@ export default function ChatWorkspace({
     route === 'search' || route === 'profile' || route === 'settings' ? route : 'chats';
 
   const isMobileChatOpen = route === 'chat' && activeConvo !== null;
+
+  const stagedFileIcon = selectedFile
+    ? selectedFile.type.startsWith('video/')
+      ? Film
+      : selectedFile.type.startsWith('image/')
+      ? ImageIcon
+      : selectedFile.type.startsWith('audio/')
+      ? Music
+      : FileText
+    : FileText;
+  const StagedIcon = stagedFileIcon;
 
   return (
     <div className="h-[calc(100vh-57px)] max-w-7xl mx-auto px-0 lg:px-6 lg:py-5">
@@ -449,22 +574,52 @@ export default function ChatWorkspace({
                 <div className="flex items-center justify-between gap-3 pt-4 border-t border-slate-100 dark:border-slate-800">
                   <div>
                     <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                      Push Notifications
+                      Message Sound Effects
                     </div>
                     <div className="text-xs text-slate-500 dark:text-slate-400">
-                      Alert on incoming background messages
+                      Play chime when new chat messages arrive
                     </div>
                   </div>
                   <button
-                    onClick={onToggleNotifications}
+                    onClick={onToggleSound}
                     className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold ${
-                      notificationsEnabled
+                      soundEnabled
                         ? 'bg-teal-600 text-white'
                         : 'border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
                     }`}
                   >
-                    <Bell className="w-3.5 h-3.5" />
-                    <span>{notificationsEnabled ? 'Enabled' : 'Enable'}</span>
+                    {soundEnabled ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
+                    <span>{soundEnabled ? 'On' : 'Muted'}</span>
+                  </button>
+                </div>
+
+                <div className="space-y-2.5 pt-4 border-t border-slate-100 dark:border-slate-800">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        Message Notifications
+                      </div>
+                      <div className="text-xs text-slate-500 dark:text-slate-400">
+                        Desktop & in-app alerts on arriving messages
+                      </div>
+                    </div>
+                    <button
+                      onClick={onToggleNotifications}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold ${
+                        notificationsEnabled
+                          ? 'bg-teal-600 text-white'
+                          : 'border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+                      }`}
+                    >
+                      <Bell className="w-3.5 h-3.5" />
+                      <span>{notificationsEnabled ? 'Enabled' : 'Enable'}</span>
+                    </button>
+                  </div>
+                  <button
+                    onClick={onTestNotification}
+                    className="w-full py-2 px-3 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+                  >
+                    Test Notification & Arrival Sound
                   </button>
                 </div>
 
@@ -536,7 +691,7 @@ export default function ChatWorkspace({
             )}
           </div>
 
-          {/* Bottom Tab Bar (Thumb-accessible on mobile & clean switcher on desktop) */}
+          {/* Bottom Tab Bar */}
           <nav className="grid grid-cols-4 border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
             {[
               { id: 'chats' as const, label: 'Chats', icon: Lock },
@@ -566,10 +721,26 @@ export default function ChatWorkspace({
 
         {/* RIGHT PANE: Private Chat Screen */}
         <section
-          className={`lg:col-span-8 h-full flex flex-col bg-white dark:bg-slate-900 lg:border lg:border-slate-200 lg:dark:border-slate-800 lg:rounded-2xl overflow-hidden ${
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          className={`lg:col-span-8 h-full flex flex-col bg-white dark:bg-slate-900 lg:border lg:border-slate-200 lg:dark:border-slate-800 lg:rounded-2xl overflow-hidden relative ${
             isMobileChatOpen ? 'flex' : 'hidden lg:flex'
           }`}
         >
+          {isDraggingOver && (
+            <div className="absolute inset-0 z-30 bg-teal-600/15 backdrop-blur-[2px] border-2 border-dashed border-teal-500 rounded-2xl flex items-center justify-center pointer-events-none">
+              <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl px-6 py-4 text-center shadow-lg">
+                <p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                  Drop file or video to encrypt & send
+                </p>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                  Maximum size: 100 MB
+                </p>
+              </div>
+            </div>
+          )}
+
           {!activeConvo ? (
             <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-3">
               <div className="w-12 h-12 rounded-2xl bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
@@ -579,13 +750,13 @@ export default function ChatWorkspace({
                 Select or start an encrypted conversation
               </h2>
               <p className="max-w-sm text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                All private messages are encrypted client-side with ECDH P-256 and AES-256-GCM before leaving your device.
+                All private messages, files, and videos (up to 100 MB) are encrypted client-side with ECDH P-256 and AES-256-GCM before leaving your device.
               </p>
             </div>
           ) : (
             <>
               {/* Chat Header */}
-              <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3">
+              <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
                 <div className="flex items-center gap-3 min-w-0">
                   <button
                     onClick={() => setRoute('chats')}
@@ -599,7 +770,7 @@ export default function ChatWorkspace({
                       <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
                         {activeConvo.peer.displayName}
                       </h2>
-                      <span className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                      <span className="text-xs text-slate-500 dark:text-slate-400 truncate hidden sm:inline">
                         @{activeConvo.peer.username}
                       </span>
                     </div>
@@ -614,26 +785,49 @@ export default function ChatWorkspace({
                         {activeConvo.peer.online ? 'Online' : 'Offline'}
                       </span>
                       <span aria-hidden="true">·</span>
-                      <span>End-to-end encrypted</span>
+                      <span className="truncate">End-to-end encrypted</span>
                     </div>
                   </div>
                 </div>
 
                 <div className="flex items-center gap-1.5 shrink-0">
                   <button
+                    onClick={() => onStartCall(activeConvo.id, activeConvo.peer, 'audio')}
+                    disabled={connectionStatus !== 'connected' || callActive}
+                    className="inline-flex items-center justify-center gap-1.5 min-h-[38px] min-w-[38px] px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
+                    title="Start Audio Call"
+                    aria-label="Audio call"
+                  >
+                    <Phone className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
+                    <span className="hidden md:inline">Audio</span>
+                  </button>
+                  <button
+                    onClick={() => onStartCall(activeConvo.id, activeConvo.peer, 'video')}
+                    disabled={connectionStatus !== 'connected' || callActive}
+                    className="inline-flex items-center justify-center gap-1.5 min-h-[38px] min-w-[38px] px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
+                    title="Start Video Call"
+                    aria-label="Video call"
+                  >
+                    <Video className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
+                    <span className="hidden md:inline">Video</span>
+                  </button>
+                  <button
                     onClick={handleOpenFingerprint}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
+                    className="inline-flex items-center justify-center gap-1.5 min-h-[38px] min-w-[38px] px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
+                    title="Verify Encryption Keys"
+                    aria-label="Verify Encryption Keys"
                   >
                     <ShieldCheck className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
-                    <span className="hidden sm:inline">Verify Keys</span>
+                    <span className="hidden xl:inline">Verify Keys</span>
                   </button>
                   <button
                     onClick={() => onClearHistoryLocally(activeConvo.id)}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
+                    className="inline-flex items-center justify-center gap-1.5 min-h-[38px] min-w-[38px] px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
                     title="Clear conversation history on this device only"
+                    aria-label="Clear history locally"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Clear History</span>
+                    <span className="hidden xl:inline">Clear</span>
                   </button>
                 </div>
               </div>
@@ -665,7 +859,7 @@ export default function ChatWorkspace({
 
                 {visibleMessages.length === 0 ? (
                   <div className="py-16 text-center text-xs text-slate-500 dark:text-slate-400">
-                    No messages yet. Send an encrypted text message below.
+                    No messages yet. Send an encrypted message, file, or video below.
                   </div>
                 ) : (
                   visibleMessages.map((msg) => {
@@ -675,7 +869,7 @@ export default function ChatWorkspace({
                         key={msg.cid || msg.id}
                         className={`flex ${isMine ? 'justify-end' : 'justify-start'} group`}
                       >
-                        <div className="flex items-end gap-1.5 max-w-[82%] sm:max-w-[70%]">
+                        <div className="flex items-end gap-1.5 max-w-[85%] sm:max-w-[72%]">
                           {isMine && (
                             <button
                               onClick={() => onDeleteMessageLocally(activeConvo.id, msg.id)}
@@ -694,9 +888,19 @@ export default function ChatWorkspace({
                                 : 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-200 dark:border-slate-800 rounded-bl-sm'
                             }`}
                           >
-                            <p className="whitespace-pre-wrap">{msg.plaintext}</p>
+                            {msg.attachment ? (
+                              <AttachmentBubble
+                                attachment={msg.attachment}
+                                authToken={authToken}
+                                isMine={isMine}
+                                onBytesReceived={onAttachmentBytesReceived}
+                              />
+                            ) : (
+                              <p className="whitespace-pre-wrap">{msg.plaintext}</p>
+                            )}
+
                             <div
-                              className={`mt-1 flex items-center justify-end gap-1 text-[11px] font-mono tabular-nums ${
+                              className={`mt-1.5 flex items-center justify-end gap-1 text-[11px] font-mono tabular-nums ${
                                 isMine ? 'text-teal-100' : 'text-slate-400 dark:text-slate-500'
                               }`}
                             >
@@ -755,21 +959,105 @@ export default function ChatWorkspace({
                 <div ref={messagesEndRef} />
               </div>
 
+              {/* Staged Attachment / Upload Progress / Error Bar */}
+              {(selectedFile || attachmentError) && (
+                <div className="px-3 pt-2.5 pb-1 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/90 space-y-2">
+                  {attachmentError && (
+                    <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 text-xs text-red-700 dark:text-red-300">
+                      <span>{attachmentError}</span>
+                      <button
+                        type="button"
+                        onClick={() => setAttachmentError(null)}
+                        className="p-0.5 hover:opacity-75"
+                        aria-label="Dismiss error"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+
+                  {selectedFile && (
+                    <div className="px-3 py-2 rounded-xl bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 space-y-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <StagedIcon className="w-4 h-4 text-teal-600 dark:text-teal-400 shrink-0" />
+                          <div className="min-w-0">
+                            <p className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
+                              {selectedFile.name}
+                            </p>
+                            <p className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400">
+                              {formatBytes(selectedFile.size)} · Max 100 MB · Encrypted before upload
+                            </p>
+                          </div>
+                        </div>
+                        {!uploading && (
+                          <button
+                            type="button"
+                            onClick={() => setSelectedFile(null)}
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                            aria-label="Remove attachment"
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
+                        )}
+                      </div>
+
+                      {uploading && (
+                        <div className="space-y-1">
+                          <div className="flex justify-between text-[11px] font-mono tabular-nums text-teal-700 dark:text-teal-400">
+                            <span>Encrypting & uploading...</span>
+                            <span>{uploadProgress}%</span>
+                          </div>
+                          <div className="h-1.5 w-full bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-teal-600 transition-all duration-150"
+                              style={{ width: `${uploadProgress}%` }}
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Message Composer */}
               <form
                 onSubmit={handleSendSubmit}
                 className="p-3 border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex items-center gap-2"
               >
                 <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="*/*"
+                  onChange={handleFileInputChange}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploading}
+                  className="h-10 w-10 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40 flex items-center justify-center transition-colors shrink-0"
+                  title="Attach file or video (max 100 MB)"
+                  aria-label="Attach file or video"
+                >
+                  <Paperclip className="w-4 h-4" />
+                </button>
+                <input
                   type="text"
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
-                  placeholder="Write an encrypted text message..."
+                  disabled={uploading}
+                  placeholder={
+                    selectedFile
+                      ? 'Add an optional caption...'
+                      : 'Write an encrypted message or attach a file/video (max 100 MB)...'
+                  }
                   className="flex-1 px-4 py-2.5 text-sm rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-teal-500"
                 />
                 <button
                   type="submit"
-                  disabled={!draft.trim()}
+                  disabled={uploading || (!draft.trim() && !selectedFile)}
                   className="h-10 w-10 rounded-xl bg-teal-600 hover:bg-teal-700 disabled:opacity-40 text-white flex items-center justify-center transition-colors shrink-0"
                   aria-label="Send message"
                 >

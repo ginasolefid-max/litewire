@@ -13,6 +13,8 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
 const STORE_PATH = path.join(DATA_DIR, 'litewire-store.json');
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB maximum file/video size
 const ANDROID_DIR = path.join(__dirname, 'android-project');
 
 interface UserRecord {
@@ -51,6 +53,14 @@ interface ConversationRecord {
   updatedAt: number;
 }
 
+interface FileRecord {
+  id: string;
+  convoId: string;
+  uploaderId: string;
+  sizeBytes: number;
+  createdAt: number;
+}
+
 interface StoreState {
   globalSeq: number;
   users: Record<string, UserRecord>;
@@ -58,6 +68,7 @@ interface StoreState {
   sessions: Record<string, SessionRecord>;
   conversations: Record<string, ConversationRecord>;
   messages: Record<string, MessageRecord[]>;
+  files: Record<string, FileRecord>;
 }
 
 const DEFAULT_STORE: StoreState = {
@@ -67,6 +78,7 @@ const DEFAULT_STORE: StoreState = {
   sessions: {},
   conversations: {},
   messages: {},
+  files: {},
 };
 
 function loadStore(): StoreState {
@@ -82,6 +94,7 @@ function loadStore(): StoreState {
         sessions: parsed.sessions || {},
         conversations: parsed.conversations || {},
         messages: parsed.messages || {},
+        files: parsed.files || {},
       };
     }
   } catch (err) {
@@ -490,6 +503,166 @@ app.get('/api/conversations/:id/messages', requireAuth, (req: AuthedRequest, res
   res.json({ messages: result, hasMore });
 });
 
+// Encrypted file / video upload (up to 100 MB maximum)
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+app.post('/api/files/upload', requireAuth, (req: AuthedRequest, res: Response) => {
+  const convoId = String(req.headers['x-convo-id'] || req.query.convoId || '').trim();
+  const convo = store.conversations[convoId];
+  if (!convo || !convo.participants.includes(req.userId!)) {
+    res.status(403).json({ error: 'Forbidden: you are not a participant of this conversation.' });
+    return;
+  }
+
+  const contentLength = Number(req.headers['content-length'] || 0);
+  if (contentLength > MAX_FILE_SIZE_BYTES) {
+    res.status(413).json({ error: 'File exceeds the 100 MB maximum size limit.' });
+    return;
+  }
+
+  if (!fs.existsSync(UPLOADS_DIR)) {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  }
+
+  const fileId = crypto.randomUUID();
+  const baseUploadsDir = path.resolve(UPLOADS_DIR);
+  const tmpPath = path.resolve(baseUploadsDir, `${fileId}.tmp`);
+  const finalPath = path.resolve(baseUploadsDir, `${fileId}.enc`);
+
+  if (!tmpPath.startsWith(baseUploadsDir + path.sep) || !finalPath.startsWith(baseUploadsDir + path.sep)) {
+    res.status(400).json({ error: 'Invalid upload destination.' });
+    return;
+  }
+
+  const writeStream = fs.createWriteStream(tmpPath);
+  let receivedBytes = 0;
+  let aborted = false;
+
+  const cleanupTmp = () => {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      // ignore cleanup error
+    }
+  };
+
+  req.on('data', (chunk: Buffer) => {
+    if (aborted) return;
+    receivedBytes += chunk.length;
+    if (receivedBytes > MAX_FILE_SIZE_BYTES) {
+      aborted = true;
+      req.pause();
+      writeStream.destroy();
+      cleanupTmp();
+      if (!res.headersSent) {
+        res.status(413).json({ error: 'File exceeds the 100 MB maximum size limit.' });
+      }
+      return;
+    }
+    if (!writeStream.write(chunk)) {
+      req.pause();
+      writeStream.once('drain', () => {
+        if (!aborted) req.resume();
+      });
+    }
+  });
+
+  req.on('end', () => {
+    if (aborted) return;
+    writeStream.end(() => {
+      if (receivedBytes === 0) {
+        cleanupTmp();
+        if (!res.headersSent) {
+          res.status(400).json({ error: 'Uploaded file is empty.' });
+        }
+        return;
+      }
+      try {
+        fs.renameSync(tmpPath, finalPath);
+        store.files[fileId] = {
+          id: fileId,
+          convoId,
+          uploaderId: req.userId!,
+          sizeBytes: receivedBytes,
+          createdAt: Date.now(),
+        };
+        persistStore();
+        if (!res.headersSent) {
+          res.status(201).json({ fileId, sizeBytes: receivedBytes });
+        }
+      } catch {
+        cleanupTmp();
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to store encrypted attachment.' });
+        }
+      }
+    });
+  });
+
+  req.on('error', () => {
+    aborted = true;
+    writeStream.destroy();
+    cleanupTmp();
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Upload stream interrupted.' });
+    }
+  });
+
+  req.on('aborted', () => {
+    aborted = true;
+    writeStream.destroy();
+    cleanupTmp();
+  });
+
+  writeStream.on('error', () => {
+    aborted = true;
+    cleanupTmp();
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to write encrypted attachment.' });
+    }
+  });
+});
+
+// Download encrypted file / video (strictly participant-authorized)
+app.get('/api/files/:fileId', requireAuth, (req: AuthedRequest, res: Response) => {
+  const fileId = String(req.params.fileId || '').trim();
+  if (!UUID_RE.test(fileId)) {
+    res.status(400).json({ error: 'Invalid attachment identifier.' });
+    return;
+  }
+
+  const record = store.files[fileId];
+  if (!record) {
+    res.status(404).json({ error: 'Attachment not found.' });
+    return;
+  }
+
+  const convo = store.conversations[record.convoId];
+  if (!convo || !convo.participants.includes(req.userId!)) {
+    res.status(403).json({ error: 'Forbidden: you are not a participant of this conversation.' });
+    return;
+  }
+
+  const baseUploadsDir = path.resolve(UPLOADS_DIR);
+  const filePath = path.resolve(baseUploadsDir, `${fileId}.enc`);
+  if (!filePath.startsWith(baseUploadsDir + path.sep) || !fs.existsSync(filePath)) {
+    res.status(404).json({ error: 'Encrypted attachment file is unavailable.' });
+    return;
+  }
+
+  const stat = fs.statSync(filePath);
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Length', String(stat.size));
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+
+  const readStream = fs.createReadStream(filePath);
+  readStream.on('error', () => {
+    if (!res.headersSent) res.status(500).end();
+  });
+  readStream.pipe(res);
+});
+
 // Android project source explorer API (reads directly from /android-project on disk)
 function walkAndroidDir(dir: string, base: string): Array<{ path: string; content: string; sizeBytes: number }> {
   if (!fs.existsSync(dir)) return [];
@@ -514,7 +687,7 @@ app.get('/api/android-files', (_req: Request, res: Response) => {
 
 // --- HTTP + WebSocket Server ---
 const httpServer = createServer(app);
-const wss = new WebSocketServer({ server: httpServer, path: '/ws', maxPayload: 64 * 1024 });
+const wss = new WebSocketServer({ server: httpServer, path: '/ws', maxPayload: 128 * 1024 });
 
 // Heartbeat: drop dead mobile connections so users don't show online forever.
 const aliveSockets = new WeakSet<WebSocket>();
@@ -694,6 +867,46 @@ wss.on('connection', (ws, req) => {
         delta.sort((a, b) => a.seq - b.seq);
         if (delta.length > 0) persistStore();
         sendJson(ws, { t: 'delta', msgs: delta, seq: store.globalSeq });
+      }
+
+      // WebRTC Audio/Video Call Signaling Relay (strict participant authorization)
+      if (
+        msg.t === 'call:offer' ||
+        msg.t === 'call:answer' ||
+        msg.t === 'call:ice' ||
+        msg.t === 'call:reject' ||
+        msg.t === 'call:hangup' ||
+        msg.t === 'call:busy'
+      ) {
+        const convoId = String(msg.c || '');
+        const callId = String(msg.callId || '');
+        const convo = store.conversations[convoId];
+        if (!convo || !convo.participants.includes(userId) || !callId) {
+          return;
+        }
+        const peerId = convo.participants.find((id) => id !== userId);
+        if (!peerId) return;
+
+        if (msg.t === 'call:offer' && !isUserOnline(peerId)) {
+          sendJson(ws, {
+            t: 'call:unavailable',
+            c: convoId,
+            callId,
+            reason: 'offline',
+          });
+          return;
+        }
+
+        sendToUser(peerId, {
+          t: msg.t,
+          c: convoId,
+          callId,
+          from: userId,
+          callType: msg.callType === 'video' ? 'video' : 'audio',
+          sdp: msg.sdp,
+          candidate: msg.candidate,
+          reason: msg.reason ? String(msg.reason) : undefined,
+        });
       }
     } catch {
       // Ignore malformed JSON frames cleanly

@@ -12,6 +12,19 @@ export type ScreenRoute =
 
 export type WorkspaceTab = 'messenger' | 'architecture';
 
+export type AttachmentKind = 'video' | 'image' | 'audio' | 'file';
+
+export interface AttachmentPayload {
+  fileId: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  kind: AttachmentKind;
+  fileKeyB64: string;
+  fileIvB64: string;
+  caption?: string;
+}
+
 export interface UserProfile {
   id: string;
   username: string;
@@ -40,6 +53,7 @@ export interface DecryptedMessage {
   seq: number;
   sid: string;
   plaintext: string;
+  attachment?: AttachmentPayload;
   ts: number;
   st: MessageStatus;
   deletedLocally?: boolean;
@@ -76,4 +90,30 @@ export interface AndroidProjectFile {
   path: string;
   content: string;
   sizeBytes: number;
+}
+
+export type CallType = 'audio' | 'video';
+
+export type CallStatus = 'idle' | 'calling' | 'ringing' | 'connecting' | 'connected';
+
+export interface CallSessionState {
+  callId: string;
+  convoId: string;
+  peer: UserProfile;
+  callType: CallType;
+  direction: 'outgoing' | 'incoming';
+  status: CallStatus;
+  startedAt: number | null;
+  muted: boolean;
+  cameraOff: boolean;
+  error: string | null;
+}
+
+export interface IncomingToast {
+  id: string;
+  convoId: string;
+  senderName: string;
+  senderUsername: string;
+  preview: string;
+  ts: number;
 }

@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Moon, Sun } from 'lucide-react';
+import { Bell, Moon, Sun, X } from 'lucide-react';
 import AuthViews from './components/AuthViews';
 import ChatWorkspace from './components/ChatWorkspace';
 import AndroidStudioView from './components/AndroidStudioView';
+import CallModal from './components/CallModal';
+import { cacheDecryptedAttachmentUrl } from './components/AttachmentBubble';
 import {
+  decodeMessageEnvelope,
   decryptMessage,
+  encodeAttachmentEnvelope,
+  encryptFileBuffer,
   encryptMessage,
   getOrCreateIdentityKeyPair,
 } from './crypto/e2ee';
@@ -15,15 +20,34 @@ import {
   saveTelemetry,
 } from './services/bandwidth';
 import {
+  playCallEndTone,
+  playMessageArriveSound,
+  startRingtoneLoop,
+  unlockAudio,
+} from './services/sound';
+import {
+  AttachmentKind,
+  AttachmentPayload,
+  CallSessionState,
+  CallType,
   ConversationSummary,
   DataTelemetry,
   DecryptedMessage,
+  IncomingToast,
   PendingQueueItem,
   ScreenRoute,
   UserProfile,
   WireMessage,
   WorkspaceTab,
 } from './types/messaging';
+
+const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024; // 100 MB
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ],
+};
 
 function loadLocalJson<T>(key: string, fallback: T): T {
   try {
@@ -33,6 +57,21 @@ function loadLocalJson<T>(key: string, fallback: T): T {
     // ignore
   }
   return fallback;
+}
+
+function detectAttachmentKind(mimeType: string, fileName: string): AttachmentKind {
+  const mime = mimeType.toLowerCase();
+  const ext = fileName.toLowerCase().split('.').pop() || '';
+  if (mime.startsWith('video/') || ['mp4', 'webm', 'mov', 'mkv', 'avi', 'm4v'].includes(ext)) {
+    return 'video';
+  }
+  if (mime.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) {
+    return 'image';
+  }
+  if (mime.startsWith('audio/') || ['mp3', 'wav', 'ogg', 'm4a', 'aac', 'flac'].includes(ext)) {
+    return 'audio';
+  }
+  return 'file';
 }
 
 export default function App() {
@@ -73,7 +112,19 @@ export default function App() {
   const [browserOnline, setBrowserOnline] = useState(navigator.onLine);
   const [connectionStatus, setConnectionStatus] = useState<'connected' | 'reconnecting' | 'offline'>('offline');
   const [backoffAttempt, setBackoffAttempt] = useState(0);
-  const [notificationsEnabled, setNotificationsEnabled] = useState(false);
+
+  const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(() => {
+    return localStorage.getItem('litewire_notif_enabled') !== 'false';
+  });
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
+    return localStorage.getItem('litewire_sound_enabled') !== 'false';
+  });
+  const [toasts, setToasts] = useState<IncomingToast[]>([]);
+
+  // WebRTC Call State
+  const [callSession, setCallSession] = useState<CallSessionState | null>(null);
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
 
   const [telemetry, setTelemetry] = useState<DataTelemetry>({
     bytesSentExact: 0,
@@ -89,6 +140,22 @@ export default function App() {
   const conversationsRef = useRef<ConversationSummary[]>([]);
   const activeConvoRef = useRef<string | null>(null);
   const currentUserRef = useRef<UserProfile | null>(null);
+  const notificationsEnabledRef = useRef(notificationsEnabled);
+  const soundEnabledRef = useRef(soundEnabled);
+
+  // WebRTC Refs
+  const callSessionRef = useRef<CallSessionState | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
+  const incomingOfferRef = useRef<{
+    callId: string;
+    convoId: string;
+    callType: CallType;
+    sdp: RTCSessionDescriptionInit;
+  } | null>(null);
+  const stopRingtoneRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     conversationsRef.current = conversations;
@@ -101,6 +168,40 @@ export default function App() {
   useEffect(() => {
     currentUserRef.current = currentUser;
   }, [currentUser]);
+
+  useEffect(() => {
+    notificationsEnabledRef.current = notificationsEnabled;
+    localStorage.setItem('litewire_notif_enabled', String(notificationsEnabled));
+  }, [notificationsEnabled]);
+
+  useEffect(() => {
+    soundEnabledRef.current = soundEnabled;
+    localStorage.setItem('litewire_sound_enabled', String(soundEnabled));
+  }, [soundEnabled]);
+
+  useEffect(() => {
+    callSessionRef.current = callSession;
+  }, [callSession]);
+
+  // Update browser tab title with total unread count
+  useEffect(() => {
+    const totalUnread = conversations.reduce((sum, c) => sum + c.unreadCount, 0);
+    document.title =
+      totalUnread > 0
+        ? `(${totalUnread}) LiteWire — Lightweight Encrypted Messaging`
+        : 'LiteWire — Lightweight Encrypted Messaging';
+  }, [conversations]);
+
+  // Unlock Web Audio on first user interaction so incoming sounds work cleanly
+  useEffect(() => {
+    const onInteract = () => unlockAudio();
+    window.addEventListener('pointerdown', onInteract, { passive: true });
+    window.addEventListener('keydown', onInteract, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', onInteract);
+      window.removeEventListener('keydown', onInteract);
+    };
+  }, []);
 
   // Sync Tailwind .dark class on <html>
   useEffect(() => {
@@ -122,6 +223,58 @@ export default function App() {
     };
   }, []);
 
+  const pushToast = useCallback(
+    (toast: Omit<IncomingToast, 'id' | 'ts'>) => {
+      const id = crypto.randomUUID();
+      const item: IncomingToast = { ...toast, id, ts: Date.now() };
+      setToasts((prev) => [...prev.slice(-3), item]);
+      window.setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+      }, 5000);
+    },
+    []
+  );
+
+  const notifyIncomingMessage = useCallback(
+    (convoId: string, previewText: string, senderUser?: UserProfile) => {
+      if (soundEnabledRef.current) {
+        playMessageArriveSound();
+      }
+
+      if (!notificationsEnabledRef.current) return;
+
+      const senderName = senderUser?.displayName || 'New Message';
+      const senderUsername = senderUser?.username || 'litewire';
+
+      pushToast({
+        convoId,
+        senderName,
+        senderUsername,
+        preview: previewText,
+      });
+
+      if ('Notification' in window && Notification.permission === 'granted') {
+        if (document.hidden || activeConvoRef.current !== convoId) {
+          try {
+            const notif = new Notification(`${senderName} (@${senderUsername})`, {
+              body: previewText,
+              icon: '/icon.svg',
+            });
+            notif.onclick = () => {
+              window.focus();
+              setActiveConvoId(convoId);
+              setRoute('chat');
+              notif.close();
+            };
+          } catch {
+            // ignore notification API errors in restricted contexts
+          }
+        }
+      }
+    },
+    [pushToast]
+  );
+
   const recordOutbound = useCallback((payloadStr: string, isChatMsg: boolean) => {
     const uid = currentUserRef.current?.id;
     if (!uid) return;
@@ -137,6 +290,19 @@ export default function App() {
     if (!uid) return;
     setTelemetry((prev) => {
       const next = addInboundTelemetry(prev, payloadStr, isChatMsg);
+      saveTelemetry(uid, next);
+      return next;
+    });
+  }, []);
+
+  const recordRawBytes = useCallback((direction: 'sent' | 'received', bytes: number) => {
+    const uid = currentUserRef.current?.id;
+    if (!uid || bytes <= 0) return;
+    setTelemetry((prev) => {
+      const next: DataTelemetry =
+        direction === 'sent'
+          ? { ...prev, bytesSentExact: prev.bytesSentExact + bytes }
+          : { ...prev, bytesReceivedExact: prev.bytesReceivedExact + bytes };
       saveTelemetry(uid, next);
       return next;
     });
@@ -158,6 +324,313 @@ export default function App() {
     localStorage.setItem(`litewire_queue_${currentUser.id}`, JSON.stringify(pendingQueue));
   }, [pendingQueue, currentUser]);
 
+  // --- WebRTC Cleanup & Controls ---
+  const cleanupCall = useCallback((playTone = false) => {
+    if (stopRingtoneRef.current) {
+      stopRingtoneRef.current();
+      stopRingtoneRef.current = null;
+    }
+    if (pcRef.current) {
+      pcRef.current.onicecandidate = null;
+      pcRef.current.ontrack = null;
+      pcRef.current.onconnectionstatechange = null;
+      pcRef.current.close();
+      pcRef.current = null;
+    }
+    if (localStreamRef.current) {
+      for (const track of localStreamRef.current.getTracks()) {
+        track.stop();
+      }
+      localStreamRef.current = null;
+    }
+    if (remoteStreamRef.current) {
+      for (const track of remoteStreamRef.current.getTracks()) {
+        track.stop();
+      }
+      remoteStreamRef.current = null;
+    }
+    pendingIceRef.current = [];
+    incomingOfferRef.current = null;
+    setLocalStream(null);
+    setRemoteStream(null);
+    setCallSession(null);
+    if (playTone && soundEnabledRef.current) {
+      playCallEndTone();
+    }
+  }, []);
+
+  const createPeerConnection = useCallback(
+    (convoId: string, callId: string, callType: CallType, stream: MediaStream) => {
+      const pc = new RTCPeerConnection(RTC_CONFIG);
+      pcRef.current = pc;
+
+      for (const track of stream.getTracks()) {
+        pc.addTrack(track, stream);
+      }
+
+      const incomingMedia = new MediaStream();
+      remoteStreamRef.current = incomingMedia;
+      setRemoteStream(incomingMedia);
+
+      pc.ontrack = (event) => {
+        if (event.streams && event.streams[0]) {
+          for (const t of event.streams[0].getTracks()) {
+            incomingMedia.addTrack(t);
+          }
+          setRemoteStream(new MediaStream(incomingMedia.getTracks()));
+        } else if (event.track) {
+          incomingMedia.addTrack(event.track);
+          setRemoteStream(new MediaStream(incomingMedia.getTracks()));
+        }
+      };
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate && wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              t: 'call:ice',
+              c: convoId,
+              callId,
+              callType,
+              candidate: event.candidate.toJSON(),
+            })
+          );
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        const state = pc.connectionState;
+        if (state === 'connected') {
+          if (stopRingtoneRef.current) {
+            stopRingtoneRef.current();
+            stopRingtoneRef.current = null;
+          }
+          setCallSession((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  status: 'connected',
+                  startedAt: prev.startedAt || Date.now(),
+                  error: null,
+                }
+              : null
+          );
+        } else if (state === 'failed' || state === 'closed') {
+          cleanupCall(true);
+        }
+      };
+
+      return pc;
+    },
+    [cleanupCall]
+  );
+
+  const handleStartCall = useCallback(
+    async (convoId: string, peer: UserProfile, callType: CallType) => {
+      if (callSessionRef.current) return;
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+
+      const callId = crypto.randomUUID();
+      setCallSession({
+        callId,
+        convoId,
+        peer,
+        callType,
+        direction: 'outgoing',
+        status: 'calling',
+        startedAt: null,
+        muted: false,
+        cameraOff: callType === 'audio',
+        error: null,
+      });
+
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error('Camera/Microphone access requires HTTPS or localhost.');
+        }
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: callType === 'video' ? { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } } : false,
+        });
+        localStreamRef.current = stream;
+        setLocalStream(stream);
+
+        const pc = createPeerConnection(convoId, callId, callType, stream);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        wsRef.current.send(
+          JSON.stringify({
+            t: 'call:offer',
+            c: convoId,
+            callId,
+            callType,
+            sdp: offer,
+          })
+        );
+
+        if (soundEnabledRef.current) {
+          stopRingtoneRef.current = startRingtoneLoop('outgoing');
+        }
+      } catch (err) {
+        cleanupCall(false);
+        pushToast({
+          convoId,
+          senderName: 'Call Failed',
+          senderUsername: peer.username,
+          preview:
+            err instanceof Error
+              ? err.message
+              : 'Could not access microphone or camera permissions.',
+        });
+      }
+    },
+    [createPeerConnection, cleanupCall, pushToast]
+  );
+
+  const handleAcceptCall = useCallback(async () => {
+    const session = callSessionRef.current;
+    const offerInfo = incomingOfferRef.current;
+    if (!session || !offerInfo || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      cleanupCall(false);
+      return;
+    }
+
+    if (stopRingtoneRef.current) {
+      stopRingtoneRef.current();
+      stopRingtoneRef.current = null;
+    }
+
+    setCallSession((prev) => (prev ? { ...prev, status: 'connecting', error: null } : null));
+
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Camera/Microphone access requires HTTPS or localhost.');
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video:
+          offerInfo.callType === 'video'
+            ? { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
+            : false,
+      });
+      localStreamRef.current = stream;
+      setLocalStream(stream);
+
+      const pc = createPeerConnection(
+        offerInfo.convoId,
+        offerInfo.callId,
+        offerInfo.callType,
+        stream
+      );
+
+      await pc.setRemoteDescription(new RTCSessionDescription(offerInfo.sdp));
+
+      for (const candidate of pendingIceRef.current) {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+      }
+      pendingIceRef.current = [];
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      wsRef.current.send(
+        JSON.stringify({
+          t: 'call:answer',
+          c: offerInfo.convoId,
+          callId: offerInfo.callId,
+          callType: offerInfo.callType,
+          sdp: answer,
+        })
+      );
+
+      setCallSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: 'connected',
+              startedAt: prev.startedAt || Date.now(),
+            }
+          : null
+      );
+    } catch (err) {
+      wsRef.current?.send(
+        JSON.stringify({
+          t: 'call:reject',
+          c: offerInfo.convoId,
+          callId: offerInfo.callId,
+          reason: 'media-error',
+        })
+      );
+      cleanupCall(true);
+      pushToast({
+        convoId: offerInfo.convoId,
+        senderName: 'Call Error',
+        senderUsername: session.peer.username,
+        preview:
+          err instanceof Error
+            ? err.message
+            : 'Microphone or camera permission was denied.',
+      });
+    }
+  }, [cleanupCall, createPeerConnection, pushToast]);
+
+  const handleDeclineCall = useCallback(() => {
+    const session = callSessionRef.current;
+    if (session && wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          t: 'call:reject',
+          c: session.convoId,
+          callId: session.callId,
+          reason: 'declined',
+        })
+      );
+    }
+    cleanupCall(true);
+  }, [cleanupCall]);
+
+  const handleHangupCall = useCallback(() => {
+    const session = callSessionRef.current;
+    if (session && wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          t: 'call:hangup',
+          c: session.convoId,
+          callId: session.callId,
+        })
+      );
+    }
+    cleanupCall(true);
+  }, [cleanupCall]);
+
+  const handleToggleMute = useCallback(() => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    setCallSession((prev) => {
+      if (!prev) return null;
+      const nextMuted = !prev.muted;
+      for (const track of stream.getAudioTracks()) {
+        track.enabled = !nextMuted;
+      }
+      return { ...prev, muted: nextMuted };
+    });
+  }, []);
+
+  const handleToggleCamera = useCallback(() => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    setCallSession((prev) => {
+      if (!prev) return null;
+      const nextCamOff = !prev.cameraOff;
+      for (const track of stream.getVideoTracks()) {
+        track.enabled = !nextCamOff;
+      }
+      return { ...prev, cameraOff: nextCamOff };
+    });
+  }, []);
+
+  // --- Messaging & E2EE ---
   const decryptWireMessage = useCallback(
     async (wire: WireMessage, peerPublicKey?: string): Promise<DecryptedMessage> => {
       const priv = privateKeyRef.current;
@@ -167,14 +640,16 @@ export default function App() {
         pub = convo?.peer.publicKey;
       }
 
-      let plaintext = '[Encrypted message]';
+      let rawPlaintext = '[Encrypted message]';
       if (priv && pub) {
         try {
-          plaintext = await decryptMessage(priv, pub, wire.convoId, wire.ct, wire.iv);
+          rawPlaintext = await decryptMessage(priv, pub, wire.convoId, wire.ct, wire.iv);
         } catch {
-          plaintext = '[Unable to decrypt with current device key]';
+          rawPlaintext = '[Unable to decrypt with current device key]';
         }
       }
+
+      const decoded = decodeMessageEnvelope(rawPlaintext);
 
       return {
         id: wire.id,
@@ -182,7 +657,8 @@ export default function App() {
         convoId: wire.convoId,
         seq: wire.seq,
         sid: wire.sid,
-        plaintext,
+        plaintext: decoded.plaintext,
+        attachment: decoded.attachment,
         ts: wire.ts,
         st: wire.st,
       };
@@ -203,6 +679,7 @@ export default function App() {
         nextList[idx] = {
           ...current,
           ...msg,
+          attachment: msg.attachment || current.attachment,
           deletedLocally: current.deletedLocally,
         };
       } else {
@@ -251,13 +728,14 @@ export default function App() {
         let preview = 'Encrypted conversation';
         if (c.lastMessage && privateKeyRef.current) {
           try {
-            preview = await decryptMessage(
+            const rawPlain = await decryptMessage(
               privateKeyRef.current,
               c.peer.publicKey,
               c.id,
               c.lastMessage.ct,
               c.lastMessage.iv
             );
+            preview = decodeMessageEnvelope(rawPlain).plaintext;
           } catch {
             preview = 'Encrypted message';
           }
@@ -343,7 +821,7 @@ export default function App() {
     }
   }, [recordOutbound]);
 
-  // WebSocket Connection with Exponential Backoff & Incremental Sync
+  // WebSocket Connection with Exponential Backoff, Incremental Sync & WebRTC Signaling
   useEffect(() => {
     if (!authToken || !currentUser || simulatedOffline || !browserOnline) {
       if (wsRef.current) {
@@ -374,12 +852,10 @@ export default function App() {
         setBackoffAttempt(0);
         setConnectionStatus('connected');
 
-        // 1. Request incremental delta sync since last known globalSeq
         const syncFrame = JSON.stringify({ t: 's', since: lastSeqRef.current });
         ws.send(syncFrame);
         recordOutbound(syncFrame, false);
 
-        // 2. Flush any offline queued messages
         flushPendingQueue();
       };
 
@@ -394,12 +870,12 @@ export default function App() {
             localStorage.setItem(`litewire_seq_${currentUser.id}`, String(msg.seq));
           }
 
-          // Ensure conversation metadata exists locally if brand new peer
-          let peerPub = conversationsRef.current.find((c) => c.id === msg.c)?.peer.publicKey;
-          if (!peerPub) {
+          let convo = conversationsRef.current.find((c) => c.id === msg.c);
+          if (!convo) {
             await refreshConversations(authToken);
-            peerPub = conversationsRef.current.find((c) => c.id === msg.c)?.peer.publicKey;
+            convo = conversationsRef.current.find((c) => c.id === msg.c);
           }
+          const peerPub = convo?.peer.publicKey;
 
           const wire: WireMessage = {
             id: msg.id,
@@ -415,32 +891,28 @@ export default function App() {
           const decrypted = await decryptWireMessage(wire, peerPub);
           upsertLocalMessage(wire.convoId, decrypted);
 
-          // Send delivered ack
           const ackFrame = JSON.stringify({ t: 'd', c: wire.convoId, id: wire.id });
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(ackFrame);
             recordOutbound(ackFrame, false);
           }
 
-          // Mark read immediately if user is viewing this chat, else increment unread + notify
+          if (wire.sid !== currentUser.id) {
+            notifyIncomingMessage(wire.convoId, decrypted.plaintext, convo?.peer);
+          }
+
           if (activeConvoRef.current === wire.convoId && !document.hidden) {
             const readFrame = JSON.stringify({ t: 'r', c: wire.convoId, ids: [wire.id] });
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(readFrame);
               recordOutbound(readFrame, false);
             }
-          } else {
+          } else if (wire.sid !== currentUser.id) {
             setConversations((prev) =>
               prev.map((c) =>
                 c.id === wire.convoId ? { ...c, unreadCount: c.unreadCount + 1 } : c
               )
             );
-            if (notificationsEnabled && 'Notification' in window && Notification.permission === 'granted') {
-              const peer = conversationsRef.current.find((c) => c.id === wire.convoId)?.peer;
-              new Notification(peer ? `@${peer.username}` : 'LiteWire', {
-                body: 'New end-to-end encrypted message',
-              });
-            }
           }
         } else if (msg.t === 'a') {
           recordInbound(raw, false);
@@ -448,7 +920,6 @@ export default function App() {
             lastSeqRef.current = msg.seq;
             localStorage.setItem(`litewire_seq_${currentUser.id}`, String(msg.seq));
           }
-          // Remove from pending queue idempotently and update message status
           setPendingQueue((prev) => prev.filter((item) => item.cid !== msg.cid));
           setMessagesByConvo((prev) => {
             const list = prev[msg.c] || [];
@@ -482,11 +953,143 @@ export default function App() {
           const items = (msg.msgs || []) as WireMessage[];
           if (items.length > 0) {
             await refreshConversations(authToken);
+            let lastIncoming: { convoId: string; text: string; peer?: UserProfile } | null = null;
             for (const wire of items) {
-              const dec = await decryptWireMessage(wire);
+              const convo = conversationsRef.current.find((c) => c.id === wire.convoId);
+              const dec = await decryptWireMessage(wire, convo?.peer.publicKey);
               upsertLocalMessage(wire.convoId, dec);
+              if (wire.sid !== currentUser.id) {
+                lastIncoming = { convoId: wire.convoId, text: dec.plaintext, peer: convo?.peer };
+              }
+            }
+            if (lastIncoming) {
+              notifyIncomingMessage(lastIncoming.convoId, lastIncoming.text, lastIncoming.peer);
             }
           }
+        } else if (msg.t === 'call:offer') {
+          const callId = String(msg.callId || '');
+          const convoId = String(msg.c || '');
+          const callType: CallType = msg.callType === 'video' ? 'video' : 'audio';
+
+          if (callSessionRef.current) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ t: 'call:busy', c: convoId, callId }));
+            }
+            return;
+          }
+
+          let convo = conversationsRef.current.find((c) => c.id === convoId);
+          if (!convo) {
+            await refreshConversations(authToken);
+            convo = conversationsRef.current.find((c) => c.id === convoId);
+          }
+          if (!convo) return;
+
+          incomingOfferRef.current = {
+            callId,
+            convoId,
+            callType,
+            sdp: msg.sdp as RTCSessionDescriptionInit,
+          };
+          pendingIceRef.current = [];
+
+          setCallSession({
+            callId,
+            convoId,
+            peer: convo.peer,
+            callType,
+            direction: 'incoming',
+            status: 'ringing',
+            startedAt: null,
+            muted: false,
+            cameraOff: callType === 'audio',
+            error: null,
+          });
+
+          if (soundEnabledRef.current) {
+            stopRingtoneRef.current = startRingtoneLoop('incoming');
+          }
+
+          if (
+            notificationsEnabledRef.current &&
+            'Notification' in window &&
+            Notification.permission === 'granted'
+          ) {
+            try {
+              const n = new Notification(`${convo.peer.displayName} (@${convo.peer.username})`, {
+                body: callType === 'video' ? 'Incoming video call...' : 'Incoming audio call...',
+                icon: '/icon.svg',
+              });
+              n.onclick = () => {
+                window.focus();
+                n.close();
+              };
+            } catch {
+              // ignore
+            }
+          }
+        } else if (msg.t === 'call:answer') {
+          const session = callSessionRef.current;
+          const pc = pcRef.current;
+          if (!session || session.callId !== msg.callId || !pc) return;
+
+          if (stopRingtoneRef.current) {
+            stopRingtoneRef.current();
+            stopRingtoneRef.current = null;
+          }
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          for (const c of pendingIceRef.current) {
+            await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+          }
+          pendingIceRef.current = [];
+          setCallSession((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  status: 'connected',
+                  startedAt: prev.startedAt || Date.now(),
+                }
+              : null
+          );
+        } else if (msg.t === 'call:ice') {
+          const session = callSessionRef.current;
+          if (!session || session.callId !== msg.callId || !msg.candidate) return;
+          const pc = pcRef.current;
+          if (pc && pc.remoteDescription) {
+            await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)).catch(() => {});
+          } else {
+            pendingIceRef.current.push(msg.candidate);
+          }
+        } else if (msg.t === 'call:reject' || msg.t === 'call:hangup') {
+          const session = callSessionRef.current;
+          if (!session || session.callId !== msg.callId) return;
+          const peer = session.peer;
+          const convoId = session.convoId;
+          const wasReject = msg.t === 'call:reject';
+          cleanupCall(true);
+          if (wasReject) {
+            pushToast({
+              convoId,
+              senderName: peer.displayName,
+              senderUsername: peer.username,
+              preview: 'Call declined',
+            });
+          }
+        } else if (msg.t === 'call:busy' || msg.t === 'call:unavailable') {
+          const session = callSessionRef.current;
+          if (!session || session.callId !== msg.callId) return;
+          const peer = session.peer;
+          const convoId = session.convoId;
+          cleanupCall(true);
+          pushToast({
+            convoId,
+            senderName: peer.displayName,
+            senderUsername: peer.username,
+            preview:
+              msg.t === 'call:busy'
+                ? 'User is busy on another call'
+                : 'User is offline — cannot connect call',
+          });
         }
       };
 
@@ -511,19 +1114,22 @@ export default function App() {
         wsRef.current.close();
         wsRef.current = null;
       }
+      cleanupCall(false);
     };
   }, [
     authToken,
     currentUser,
     simulatedOffline,
     browserOnline,
-    notificationsEnabled,
     decryptWireMessage,
     upsertLocalMessage,
     refreshConversations,
     flushPendingQueue,
     recordInbound,
     recordOutbound,
+    notifyIncomingMessage,
+    cleanupCall,
+    pushToast,
   ]);
 
   // Select conversation & fetch initial page + mark read
@@ -565,7 +1171,6 @@ export default function App() {
         setHasMoreByConvo((prev) => ({ ...prev, [convoId]: data.hasMore }));
       }
 
-      // Also mark existing unread local messages read
       for (const m of existing) {
         if (m.sid !== currentUserRef.current?.id && m.st !== 'read' && !unreadIds.includes(m.id)) {
           unreadIds.push(m.id);
@@ -691,6 +1296,7 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    cleanupCall(false);
     if (authToken) {
       await fetch('/api/auth/logout', {
         method: 'POST',
@@ -764,7 +1370,6 @@ export default function App() {
       trimmed
     );
 
-    // Optimistic local insert as pending
     upsertLocalMessage(convoId, {
       id: cid,
       cid,
@@ -777,6 +1382,127 @@ export default function App() {
     });
 
     const queueItem: PendingQueueItem = { cid, convoId, ct, iv, plaintext: trimmed, ts };
+    setPendingQueue((prev) => [...prev, queueItem]);
+
+    if (
+      !simulatedOffline &&
+      browserOnline &&
+      wsRef.current &&
+      wsRef.current.readyState === WebSocket.OPEN
+    ) {
+      const frame = JSON.stringify({ t: 'm', c: convoId, cid, ct, iv });
+      wsRef.current.send(frame);
+      recordOutbound(frame, true);
+    }
+  };
+
+  const handleSendAttachment = async (
+    convoId: string,
+    file: File,
+    caption: string,
+    onProgress: (pct: number) => void
+  ) => {
+    if (!currentUser || !privateKeyRef.current || !authToken) {
+      throw new Error('Authentication required.');
+    }
+    const convo = conversations.find((c) => c.id === convoId);
+    if (!convo) throw new Error('Conversation not found.');
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      throw new Error('File exceeds the 100 MB maximum size limit.');
+    }
+
+    onProgress(5);
+    const plainBuffer = await file.arrayBuffer();
+    const { encryptedBuffer, fileKeyB64, fileIvB64 } = await encryptFileBuffer(plainBuffer);
+    onProgress(15);
+
+    // Upload encrypted binary stream with progress tracking
+    const uploaded = await new Promise<{ fileId: string; sizeBytes: number }>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `/api/files/upload?convoId=${encodeURIComponent(convoId)}`);
+      xhr.setRequestHeader('Authorization', `Bearer ${authToken}`);
+      xhr.setRequestHeader('X-Convo-Id', convoId);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable) {
+          const pct = Math.min(98, 15 + Math.round((ev.loaded / ev.total) * 83));
+          onProgress(pct);
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText));
+          } catch {
+            reject(new Error('Invalid upload response from server.'));
+          }
+        } else {
+          try {
+            const errJson = JSON.parse(xhr.responseText);
+            reject(new Error(errJson.error || `Upload failed (${xhr.status})`));
+          } catch {
+            reject(new Error(`Upload failed (${xhr.status})`));
+          }
+        }
+      };
+
+      xhr.onerror = () => reject(new Error('Network error during file upload.'));
+      xhr.send(encryptedBuffer);
+    });
+
+    onProgress(100);
+    recordRawBytes('sent', uploaded.sizeBytes);
+
+    // Cache sender's local blob URL for instant inline playback
+    const localUrl = URL.createObjectURL(file);
+    cacheDecryptedAttachmentUrl(uploaded.fileId, localUrl);
+
+    const kind = detectAttachmentKind(file.type, file.name);
+    const attachment: AttachmentPayload = {
+      fileId: uploaded.fileId,
+      fileName: file.name,
+      mimeType: file.type || 'application/octet-stream',
+      sizeBytes: file.size,
+      kind,
+      fileKeyB64,
+      fileIvB64,
+      caption: caption || undefined,
+    };
+
+    const envelopeText = encodeAttachmentEnvelope(attachment);
+    const decoded = decodeMessageEnvelope(envelopeText);
+
+    const cid = crypto.randomUUID();
+    const ts = Date.now();
+    const { ct, iv } = await encryptMessage(
+      privateKeyRef.current,
+      convo.peer.publicKey,
+      convoId,
+      envelopeText
+    );
+
+    upsertLocalMessage(convoId, {
+      id: cid,
+      cid,
+      convoId,
+      seq: 0,
+      sid: currentUser.id,
+      plaintext: decoded.plaintext,
+      attachment,
+      ts,
+      st: 'pending',
+    });
+
+    const queueItem: PendingQueueItem = {
+      cid,
+      convoId,
+      ct,
+      iv,
+      plaintext: decoded.plaintext,
+      ts,
+    };
     setPendingQueue((prev) => [...prev, queueItem]);
 
     if (
@@ -808,13 +1534,49 @@ export default function App() {
   };
 
   const handleToggleNotifications = async () => {
-    if (!('Notification' in window)) return;
     if (notificationsEnabled) {
       setNotificationsEnabled(false);
       return;
     }
-    const perm = await Notification.requestPermission();
-    setNotificationsEnabled(perm === 'granted');
+    setNotificationsEnabled(true);
+    if ('Notification' in window && Notification.permission === 'default') {
+      await Notification.requestPermission().catch(() => {});
+    }
+  };
+
+  const handleToggleSound = () => {
+    unlockAudio();
+    setSoundEnabled((prev) => {
+      const next = !prev;
+      if (next) playMessageArriveSound();
+      return next;
+    });
+  };
+
+  const handleTestNotification = async () => {
+    unlockAudio();
+    if (soundEnabledRef.current) {
+      playMessageArriveSound();
+    }
+    if ('Notification' in window && Notification.permission === 'default') {
+      await Notification.requestPermission().catch(() => {});
+    }
+    pushToast({
+      convoId: activeConvoId || '',
+      senderName: currentUser?.displayName || 'LiteWire',
+      senderUsername: currentUser?.username || 'system',
+      preview: 'Incoming message notification & arrival chime active',
+    });
+    if ('Notification' in window && Notification.permission === 'granted') {
+      try {
+        new Notification('LiteWire Test Alert', {
+          body: 'Message notifications and sound effects are working.',
+          icon: '/icon.svg',
+        });
+      } catch {
+        // ignore
+      }
+    }
   };
 
   const handleResetTelemetry = () => {
@@ -831,6 +1593,68 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors">
+      {/* Incoming Message Toast Notifications */}
+      {toasts.length > 0 && (
+        <div className="fixed top-16 right-4 z-50 flex flex-col gap-2 max-w-sm w-[calc(100vw-2rem)] pointer-events-none">
+          {toasts.map((toast) => (
+            <div
+              key={toast.id}
+              className="pointer-events-auto bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl p-3.5 shadow-xl flex items-start gap-3"
+            >
+              <div className="w-8 h-8 rounded-xl bg-teal-600/15 text-teal-700 dark:text-teal-400 flex items-center justify-center shrink-0 mt-0.5">
+                <Bell className="w-4 h-4" />
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (toast.convoId) {
+                    handleSelectConversation(toast.convoId);
+                    setRoute('chat');
+                    setWorkspaceTab('messenger');
+                  }
+                  setToasts((prev) => prev.filter((t) => t.id !== toast.id));
+                }}
+                className="flex-1 text-left min-w-0"
+              >
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
+                    {toast.senderName}
+                  </span>
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                    @{toast.senderUsername}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-600 dark:text-slate-300 truncate mt-0.5">
+                  {toast.preview}
+                </p>
+              </button>
+              <button
+                type="button"
+                onClick={() => setToasts((prev) => prev.filter((t) => t.id !== toast.id))}
+                className="p-1 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                aria-label="Dismiss notification"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* WebRTC Audio / Video Call Modal */}
+      {callSession && (
+        <CallModal
+          call={callSession}
+          localStream={localStream}
+          remoteStream={remoteStream}
+          onAccept={handleAcceptCall}
+          onDecline={handleDeclineCall}
+          onHangup={handleHangupCall}
+          onToggleMute={handleToggleMute}
+          onToggleCamera={handleToggleCamera}
+        />
+      )}
+
       {/* Strict 3-Zone Top Bar */}
       <header className="h-14 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-4 sm:px-6 flex items-center justify-between gap-8">
         <a
@@ -905,9 +1729,12 @@ export default function App() {
           hasMoreMessages={activeConvoId ? Boolean(hasMoreByConvo[activeConvoId]) : false}
           onLoadOlderMessages={handleLoadOlderMessages}
           onSendMessage={handleSendMessage}
+          onSendAttachment={handleSendAttachment}
           onDeleteMessageLocally={handleDeleteMessageLocally}
           onClearHistoryLocally={handleClearHistoryLocally}
           onStartChatWithUser={handleStartChatWithUser}
+          onStartCall={handleStartCall}
+          callActive={callSession !== null}
           searchResults={searchResults}
           searchingUsers={searchingUsers}
           onSearchUsers={handleSearchUsers}
@@ -918,10 +1745,14 @@ export default function App() {
           onToggleSimulatedOffline={() => setSimulatedOffline((s) => !s)}
           telemetry={telemetry}
           onResetTelemetry={handleResetTelemetry}
+          onAttachmentBytesReceived={(bytes) => recordRawBytes('received', bytes)}
           darkMode={darkMode}
           onToggleDarkMode={() => setDarkMode((d) => !d)}
           notificationsEnabled={notificationsEnabled}
           onToggleNotifications={handleToggleNotifications}
+          soundEnabled={soundEnabled}
+          onToggleSound={handleToggleSound}
+          onTestNotification={handleTestNotification}
           onLogout={handleLogout}
           authToken={authToken || ''}
         />
